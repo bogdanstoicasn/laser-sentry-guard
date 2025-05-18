@@ -9,6 +9,24 @@
 #define TRIG_L PIND6
 #define ECHO_L PIND7
 
+#define DEBUG 1
+
+#define MAX_DETECT_DIST(adc_val) (20 + ((adc_val) * 60) / 1023)
+
+/*
+ * Structure that holds the movement related data
+ * such as direction, aggression and if motion was detected*/
+typedef struct {
+	uint8_t left;
+	uint8_t right;
+	uint8_t motion;
+	uint8_t flag;
+	uint16_t aggression;
+}movement;
+
+movement my_data = {0};
+
+/* Debug section */
 void init_usart_func(void)
 {
     usart_config testusart = {
@@ -51,6 +69,7 @@ void usart_transmit_number(uint16_t number)
     }
 }
 
+/* Sensor Section */
 void timer0_init(void)
 {
     // Set Timer0 in normal mode (no PWM, no CTC, no Fast PWM)
@@ -59,7 +78,8 @@ void timer0_init(void)
     TCNT0 = 0;  // Clear timer count
 }
 
-void distance_sensor_init()
+/* Init the 3 sensors(2 distance and 1 movement) */
+void sensors_init()
 {
 	// sensor 1 section (right)
 	DDRD |= (1 << TRIG_R); 
@@ -68,7 +88,15 @@ void distance_sensor_init()
 	// sensor 2 section (left)
 	DDRD |= (1 << TRIG_L);
 	DDRD &= ~(1 << ECHO_L);
+
+	// motion sensor(little bit more complicated cuz we have to use interrupts)
+	DDRB &= ~(1 << PORTB0);
+
+	PCICR |= (1 << PCIE0);
+	PCMSK0 |= (1 << PCINT0);
 }
+
+/* Trigger the distance sensors */
 void distance_sensor_trigger(uint8_t trigger_pin)
 {
     PORTD |= (1 << trigger_pin);  // Set trigger high
@@ -76,6 +104,11 @@ void distance_sensor_trigger(uint8_t trigger_pin)
     PORTD &= ~(1 << trigger_pin); // Set trigger low
 }
 
+/* 
+ * Read the distance sensors
+ * Used the highest prescaler(1024) so we don't need to transform the reading
+ * using the formula
+ */
 uint16_t distance_sensor_read(uint8_t trigger_pin, uint8_t echo_pin)
 {
     uint16_t duration = 0;
@@ -98,30 +131,87 @@ uint16_t distance_sensor_read(uint8_t trigger_pin, uint8_t echo_pin)
     return duration; // Convert time to cm
 }
 
+/* Wrapper to read both distance  sensors */
+void read_direction(movement *mystruct)
+{
+	if (mystruct->motion == 0) return;
+	mystruct->right = distance_sensor_read(TRIG_R, ECHO_R);
+
+#if DEBUG
+	usart_transmit_number(mystruct->right & 0xFF);
+	usart_transmit_byte('R');
+	usart_transmit_byte('\n');
+	usart_transmit_byte('\r');
+#endif
+	
+	_delay_ms(100);
+
+	mystruct->left = distance_sensor_read(TRIG_L, ECHO_L);
+
+#if DEBUG
+	usart_transmit_number(mystruct->left & 0xFF);
+	usart_transmit_byte('L');
+	usart_transmit_byte('\n');
+	usart_transmit_byte('\r');
+#endif
+} 
+
+/* Potentiometer section */
+void potentiometer_init()
+{
+	adc_config my_adc = {
+		.pin = ADC0,
+		.prescaler = PRESC_VAL_32,
+		.interruptmode = 0,
+		.autotrigger_source = 0,
+		.refvoltage = AVCC_EXT_CAPACITOR_AREF_PIN,
+		.autotrigger = 0,
+	};
+	adc_init(&my_adc);
+}
+
+/* Interrupts */
+
+/* Watchdog interrupt 
+ * Resets the motion detection 
+ */
+void __vector_6(void)
+{
+	my_data.motion = 0; // reset distance sensors read capacity(no read)
+	my_data.flag = 1; // this flag triggers an AnalogRead
+#if DEBUG
+	usart_transmit_byte('0');
+#endif
+
+}
+
+void __vector_3(void)
+{
+	if (PINB & (1 << PINB0)) {
+		my_data.motion = 1;
+		usart_transmit_byte('D');
+	}
+}
 
 int main(void)
 {
-	distance_sensor_init();
-    init_usart_func();
-    usart_transmit_byte('y');
-    _delay_ms(4000);
+	wdt_enable(WDT_PRESCALER_8S, WDT_MODE_INTERRUPT);
 
-    uint16_t distance = 0;
+	sensors_init();
+	potentiometer_init();
+    init_usart_func();
+    _delay_ms(1000);
+
     timer0_init(); // Initialize Timer0
+	_delay_ms(1000);
 
     while (1) {
-        distance = distance_sensor_read(TRIG_R, ECHO_R);  // Read the distance
-        usart_transmit_number(distance & 0xFF);  // Send distance to USART
-		usart_transmit_byte('R');
-        usart_transmit_byte('\n');  // Newline
-        usart_transmit_byte('\r');  // Carriage return
-
-        /*_delay_ms(100);  // Delay before the next measurement
-		distance = distance_sensor_read(TRIG_L, ECHO_L);
-		usart_transmit_number(distance & 0xFF);
-		usart_transmit_byte('L');
-		usart_transmit_byte('\n');
-		usart_transmit_byte('\r');*/
+		read_direction(&my_data);
+		if (my_data.flag) {
+			my_data.flag = 0;
+			my_data.aggression = adc_read();
+			usart_transmit_number(my_data.aggression);
+		}
 		_delay_ms(1000);
 		
     }

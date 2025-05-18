@@ -384,4 +384,20 @@
 #define WDIE    6
 #define WDIF    7
 
+/* Interrupt section */
+#define PCICR (*(volatile uint8_t *)0x68)
+#define PCIE0 0
+#define PCIE1 1
+#define PCIE2 2
+
+#define PCMSK0 (*(volatile uint8_t *)0x6B)
+#define PCINT0 0
+#define PCINT1 1
+#define PCINT2 2
+#define PCINT3 3
+#define PCINT4 4
+#define PCINT5 5
+#define PCINT6 6
+#define PCINT7 7
+
 #endif
