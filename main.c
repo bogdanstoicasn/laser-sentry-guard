@@ -210,6 +210,7 @@ int main(void)
 		if (my_data.flag) {
 			my_data.flag = 0;
 			my_data.aggression = adc_read();
+			_delay_ms(200);
 			usart_transmit_number(my_data.aggression);
 		}
 		_delay_ms(1000);
