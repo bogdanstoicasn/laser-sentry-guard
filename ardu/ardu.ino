@@ -1,4 +1,4 @@
-#define DEBUG 0  // Set to 0 to disable debug prints
+#define DEBUG 1  // Set to 0 to disable debug prints
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -12,6 +12,20 @@
 #define ECHO_L 7    // Left sensor echo pin
 
 #define PIR_PIN 8   // Motion sensor input pin (poll selectively)
+
+#define ENABLE_INTERRUPTS() __asm__ __volatile__ ("sei" ::: "memory")
+#define DISABLE_INTERRUPTS() __asm__ __volatile__("cli" ::: "memory")
+#define RETURN_INTERRUPT() __asm__ __volatile__ ("reti"::: "memory")
+
+#define MODE 'S'  // or 'R'
+
+#if MODE == 'S'
+  #define MODE_ADDR 0x00
+#elif MODE == 'R'
+  #define MODE_ADDR 0x01
+#else
+  #error "Invalid MODE. Use 'S' or 'R'."
+#endif
 
 Servo base_servo;               // Servo object
 const uint8_t SERVO_PIN = 9;   // Servo control pin (choose a PWM pin)
@@ -63,6 +77,7 @@ typedef struct {
   uint8_t right;
   uint8_t motion;
   uint8_t flag;
+  uint8_t setting;
   uint16_t aggression;
 } movement;
 
@@ -79,6 +94,54 @@ uint16_t adc_read() {
   ADCSRA |= (1 << ADSC);
   while (ADCSRA & (1 << ADSC));
   return ADC;
+}
+
+void eeprom_write(uint16_t addr, uint8_t data)
+{
+  DISABLE_INTERRUPTS();
+
+  /* Wait for previous read/write */
+  while (EECR & (1 << EEPE));
+
+  /* Check for other operation that uses the charge pump 
+   * flash mem writing or other
+   */
+  while (SPMCSR & (1 << SELFPRGEN));
+
+  /* Set address */
+  EEARH = (addr >> 8) & 0x01;
+  EEARL = (uint8_t)addr;
+
+  /* Put the data */
+  EEDR = data;
+
+  /* Prepare for the read and start the process */
+  EECR |= (1 << EEMPE);
+
+  EECR |= (1 << EEPE);
+
+  /* Enable the interrupts again*/
+  ENABLE_INTERRUPTS();
+}
+
+uint8_t eeprom_read(uint16_t addr)
+{
+  DISABLE_INTERRUPTS();
+
+  /* Wait for previous read/write */
+  while (EECR & (1 << EEPE));
+
+  /*Set address*/
+  EEARH = (addr >> 8) & 0x01;
+  EEARL = (uint8_t)addr;
+
+  /* Read */
+  EECR |= (1 << EERE);
+
+  /* Enable interrupts*/
+  ENABLE_INTERRUPTS();
+
+  return EEDR;
 }
 
 void setup() {
@@ -98,7 +161,10 @@ void setup() {
 
   base_servo.attach(SERVO_PIN);
   base_servo.write(CENTER_ANGLE); // Start centered
-
+  my_data.setting = eeprom_read(MODE_ADDR);
+  Serial.print('M');
+  Serial.print(my_data.setting);
+  Serial.println();
   sei();
 }
 
@@ -150,14 +216,16 @@ bool check_target_in_sight() {
   }
 
   if (target_on_left) {
-    base_servo.write(LEFT_ANGLE);
-  } else { // target_on_right
     base_servo.write(RIGHT_ANGLE);
+  } else { // target_on_right
+    base_servo.write(LEFT_ANGLE);
   }
 
 
   return true;
 }
+
+#if MODE == 'S'
 
 void loop() {
   // Only poll PIR sensor if previous state was no motion (motion==0)
@@ -169,7 +237,7 @@ void loop() {
     my_data.right = readDistance(TRIG_R, ECHO_R);
     my_data.left = readDistance(TRIG_L, ECHO_L);
 
-#if DEBUG
+  #if DEBUG
     Serial.print("R:");
     Serial.print(my_data.right);
     Serial.print(" L:");
@@ -177,7 +245,7 @@ void loop() {
     Serial.print(" A:");
     Serial.print(my_data.aggression);
     Serial.println();
-#endif
+  #endif
 
     bool target_in_sight = check_target_in_sight();
 
@@ -190,3 +258,35 @@ void loop() {
 
   delay(delta_time);
 }
+
+#elif MODE == 'R'
+
+void loop() {
+  static int8_t direction = 1;               // 1 = right, -1 = left
+  static uint8_t angle = CENTER_ANGLE;       // Start at center
+
+  angle += 2 * direction;
+
+  if (angle >= 105 || angle <= 75) {
+    direction *= -1;
+    angle += 2 * direction; // prevent edge sticking
+  }
+
+  base_servo.write(angle);
+
+  // Read sensors each sweep step
+  my_data.right = readDistance(TRIG_R, ECHO_R);
+  my_data.left = readDistance(TRIG_L, ECHO_L);
+
+  Serial.print("Radar angle: ");
+  Serial.print(angle);
+  Serial.print(" | R: ");
+  Serial.print(my_data.right);
+  Serial.print(" cm | L: ");
+  Serial.print(my_data.left);
+  Serial.println(" cm");
+
+  delay(100);  // sweep speed
+}
+
+#endif
