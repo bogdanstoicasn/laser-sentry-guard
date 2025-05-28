@@ -5,6 +5,9 @@
 #include <avr/wdt.h>
 #include <Servo.h>
 
+#define BAUDRATE       9600
+#define DELAY_DEBOUNCE 75
+
 #define TRIG_R 2    // Right sensor trigger pin
 #define ECHO_R 3    // Right sensor echo pin
 
@@ -12,20 +15,14 @@
 #define ECHO_L 7    // Left sensor echo pin
 
 #define PIR_PIN 8   // Motion sensor input pin (poll selectively)
+#define BUTTON_PIN 12
 
 #define ENABLE_INTERRUPTS() __asm__ __volatile__ ("sei" ::: "memory")
 #define DISABLE_INTERRUPTS() __asm__ __volatile__("cli" ::: "memory")
 #define RETURN_INTERRUPT() __asm__ __volatile__ ("reti"::: "memory")
 
-#define MODE 'S'  // or 'R'
-
-#if MODE == 'S'
-  #define MODE_ADDR 0x00
-#elif MODE == 'R'
-  #define MODE_ADDR 0x01
-#else
-  #error "Invalid MODE. Use 'S' or 'R'."
-#endif
+#define MODES_NUM 3
+#define MODE 'S'  // or 'R' or 'P'
 
 Servo base_servo;               // Servo object
 const uint8_t SERVO_PIN = 9;   // Servo control pin (choose a PWM pin)
@@ -33,7 +30,10 @@ const uint8_t SERVO_PIN = 9;   // Servo control pin (choose a PWM pin)
 const uint8_t CENTER_ANGLE = 90;
 const uint8_t LEFT_ANGLE = 60;
 const uint8_t RIGHT_ANGLE = 120;
+uint8_t modes_num[MODES_NUM];
 
+
+/* WDT SECTION */
 typedef enum {
   WDT_MODE_INTERRUPT = 0,
   WDT_MODE_RESET = 1,
@@ -71,6 +71,7 @@ void manual_wdt_enable(wdt_prescaler prescaler, wdt_mode mode) {
 
   sei();
 }
+/* END OF WDT SECTION*/
 
 typedef struct {
   uint8_t left;
@@ -78,6 +79,7 @@ typedef struct {
   uint8_t motion;
   uint8_t flag;
   uint8_t setting;
+  uint8_t setting_index;
   uint16_t aggression;
 } movement;
 
@@ -85,6 +87,7 @@ movement my_data = {200, 200, 0, 0, 0};
 unsigned long out_of_sight_time = 0;   // total time target has been out of sight (ms)
 const unsigned long delta_time = 500;  // loop delay in milliseconds
 
+/* ADC SECTION */
 void adc_init() {
   ADMUX = (1 << REFS0);
   ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
@@ -95,7 +98,9 @@ uint16_t adc_read() {
   while (ADCSRA & (1 << ADSC));
   return ADC;
 }
+/* END OF ADC SECTION */
 
+/* EEPROM SECTION */
 void eeprom_write(uint16_t addr, uint8_t data)
 {
   DISABLE_INTERRUPTS();
@@ -143,38 +148,16 @@ uint8_t eeprom_read(uint16_t addr)
 
   return EEDR;
 }
+/* END OF EEPROM SECTION */
 
-void setup() {
-  Serial.begin(9600);
-
-  manual_wdt_enable(WDT_PRESCALER_8S, WDT_MODE_INTERRUPT);
-
-  pinMode(TRIG_R, OUTPUT);
-  pinMode(ECHO_R, INPUT);
-  pinMode(TRIG_L, OUTPUT);
-  pinMode(ECHO_L, INPUT);
-
-  pinMode(PIR_PIN, INPUT);
-
-  adc_init();
-  my_data.aggression = adc_read();
-
-  base_servo.attach(SERVO_PIN);
-  base_servo.write(CENTER_ANGLE); // Start centered
-  my_data.setting = eeprom_read(MODE_ADDR);
-  Serial.print('M');
-  Serial.print(my_data.setting);
-  Serial.println();
-  sei();
-}
-
+/* HC-SR04 SECTION */
 uint16_t readDistance(uint8_t trigPin, uint8_t echoPin) {
-  digitalWrite(trigPin, LOW);
+  PORTD &= ~(1 << trigPin); 
   delayMicroseconds(2);
 
-  digitalWrite(trigPin, HIGH);
+  PORTD |= (1 << trigPin);
   delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
+  PORTD &= ~(1 << trigPin);
 
   unsigned long duration = pulseIn(echoPin, HIGH, 30000);
 
@@ -185,15 +168,6 @@ uint16_t readDistance(uint8_t trigPin, uint8_t echoPin) {
   if (distance > 200) distance = 200;
 
   return distance;
-}
-
-// Watchdog Timer interrupt to reset states every 8s
-ISR(WDT_vect) {
-  my_data.motion = 0;        // Reset motion state, allow polling again
-  my_data.flag = 1;
-  my_data.left = 200;
-  my_data.right = 200;
-  out_of_sight_time = 0;
 }
 
 bool check_in_sensor_sight(uint8_t distance) {
@@ -224,69 +198,232 @@ bool check_target_in_sight() {
 
   return true;
 }
+/* END OF HC-SR04 SECTION */
 
-#if MODE == 'S'
+/* UART SECTION */
+void usart_init_simple(void) {
+    // assume:
+    // F_CPU and BAUDRATE are defined macros
+    uint16_t ubrr = (F_CPU / (16UL * BAUDRATE)) - 1;
 
-void loop() {
-  // Only poll PIR sensor if previous state was no motion (motion==0)
-  if (my_data.motion == 0) {
-    my_data.motion = (digitalRead(PIR_PIN) == HIGH) ? 1 : 0;
-  }
-  // If motion detected, read sensors and move servo accordingly
-  if (my_data.motion == 1) {
-    my_data.right = readDistance(TRIG_R, ECHO_R);
-    my_data.left = readDistance(TRIG_L, ECHO_L);
+    // set baud rate
+    UBRR0H = (uint8_t)(ubrr >> 8);
+    UBRR0L = (uint8_t)(ubrr & 0xFF);
 
-  #if DEBUG
-    Serial.print("R:");
-    Serial.print(my_data.right);
-    Serial.print(" L:");
-    Serial.print(my_data.left);
-    Serial.print(" A:");
-    Serial.print(my_data.aggression);
-    Serial.println();
-  #endif
+    // frame format: 8 data bits, no parity, 1 stop bit
+    // UCSZ01:0 = 3 (8-bit data), UPM01:0 = 0 (parity disabled), USBS0 = 0 (1 stop bit)
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 
-    bool target_in_sight = check_target_in_sight();
+    // enable transmitter only (TX_ENABLE)
+    UCSR0B = (1 << TXEN0);
 
-    if (target_in_sight) {
-      out_of_sight_time = 0;
-    } else {
-      out_of_sight_time += delta_time;
+    // disable interrupts
+    UCSR0B &= ~((1 << RXCIE0) | (1 << TXCIE0) | (1 << UDRIE0));
+}
+
+
+uint8_t usart_receive_byte(void)
+{
+  while (!(UCSR0A & (1 << RXC0)));
+
+  return UDR0;
+}
+
+void usart_transmit_byte(uint8_t ch)
+{
+  while (!(UCSR0A & (1 << UDRE0)));
+
+  UDR0 = ch;
+}
+
+void usart_disable(void)
+{
+  /* Disable the transm and recv */
+  UCSR0B &= ~((1 << TXEN0) | (1 << RXEN0));
+
+  /* Clear flags*/
+  UCSR0A = 0;
+
+  /* Reset baud rate */
+  UBRR0L = 0;
+  UBRR0H = 0;
+
+  /* Clear other stuff */
+  UCSR0C = 0;
+}
+
+// helper cuz why not
+void usart_transmit_number(uint16_t number)
+{
+    char digits[5];
+    uint8_t i = 0;
+
+    if (number == 0) {
+        usart_transmit_byte('0');
+        return;
     }
-  }
 
-  delay(delta_time);
+    // Extract digits from the number (in reverse order)
+    while (number > 0) {
+        digits[i++] = (number % 10) + '0'; // Convert digit to ASCII
+        number /= 10;
+    }
+
+    // Transmit digits in correct order
+    while (i > 0) {
+        usart_transmit_byte(digits[--i]);
+    }
+}
+/* END OF UART SECTION */
+
+/* ISR SECTION */
+
+// Watchdog Timer interrupt to reset states every 8s
+ISR(WDT_vect) {
+  my_data.motion = 0;        // Reset motion state, allow polling again
+  my_data.flag = 1;
+  my_data.left = 200;
+  my_data.right = 200;
+  out_of_sight_time = 0;
 }
 
-#elif MODE == 'R'
+ISR(PCINT0_vect) {
+  static unsigned long last_interrupt_time = 0;
+  unsigned long current_time = millis();
+  if ((current_time - last_interrupt_time) > DELAY_DEBOUNCE) {
+    if (!(PINB & (1 << PB4))) {
+      my_data.setting_index = (my_data.setting_index + 1) % MODES_NUM;
+      my_data.setting = modes_num[my_data.setting_index];
+    }
+    last_interrupt_time = current_time;
+  }
+}
+/* END OF ISR SECTION */
+
+// Debug function to print R, L, A and mode values
+void debug_print()
+{
+  // send R
+  usart_transmit_byte('R');
+  usart_transmit_number(my_data.right);
+
+  usart_transmit_byte(' ');
+
+  // send L
+  usart_transmit_byte('L');
+  usart_transmit_number(my_data.left);
+
+  usart_transmit_byte(' ');
+
+  // send A
+  usart_transmit_byte('A');
+  usart_transmit_number(my_data.aggression);
+
+  usart_transmit_byte(' ');
+
+  // send mode
+  usart_transmit_byte('M');
+  usart_transmit_byte(my_data.setting);
+
+  // newline + carriage return
+  usart_transmit_byte('\n');
+  usart_transmit_byte('\r');
+}
+
+void setup() {
+
+  usart_init_simple();
+  manual_wdt_enable(WDT_PRESCALER_8S, WDT_MODE_INTERRUPT);
+
+  DDRD |= (1 << PD2) | (1 << PD6);   // TRIG_R and TRIG_L output
+  DDRD &= ~((1 << PD3) | (1 << PD7)); // ECHO_R and ECHO_L output
+
+  DDRB &= ~(1 << PB0); // pir
+
+  DDRB &= ~(1 << PB4); // button
+
+  adc_init();
+  my_data.aggression = adc_read();
+
+  base_servo.attach(SERVO_PIN);
+  base_servo.write(CENTER_ANGLE); // Start centered
+  
+  for (uint16_t i = 0; i < MODES_NUM; i++) {
+    modes_num[i] = eeprom_read(i);
+  }
+  
+  my_data.setting = modes_num[0];
+
+  PCICR |= (1 << PCIE0);     // Enable PCINT group 0 (PCINT0..7)
+  PCMSK0 |= (1 << PCINT4);   // Enable PCINT4 (PB4 / D12)
+  sei();
+}
 
 void loop() {
-  static int8_t direction = 1;               // 1 = right, -1 = left
-  static uint8_t angle = CENTER_ANGLE;       // Start at center
+  switch (my_data.setting) {
+    case 'S': {  // Mode S (Sentinel mode)
+      // Only poll PIR sensor if previous state was no motion
+      if (my_data.motion == 0) {
+        my_data.motion = (PINB & (1 << PB0)) ? 1 : 0;
+      }
 
-  angle += 2 * direction;
+      if (my_data.motion == 1) {
+        my_data.right = readDistance(PD2, PD3);
+        my_data.left = readDistance(PD6, PD7);
 
-  if (angle >= 105 || angle <= 75) {
-    direction *= -1;
-    angle += 2 * direction; // prevent edge sticking
+        #if DEBUG
+          debug_print();
+        #endif
+
+        bool target_in_sight = check_target_in_sight();
+
+        if (target_in_sight) {
+          out_of_sight_time = 0;
+        } else {
+          out_of_sight_time += delta_time;
+        }
+      }
+
+      delay(delta_time);
+      break;
+    }
+
+    case 'R': {  // Mode R (Radar sweep mode)
+      static int8_t direction = 1;
+      static uint8_t angle = CENTER_ANGLE;
+
+      angle += 2 * direction;
+
+      if (angle >= 105 || angle <= 75) {
+        direction *= -1;
+        angle += 2 * direction; // prevent sticking at edge
+      }
+
+      base_servo.write(angle);
+
+      my_data.right = readDistance(PD2, PD3);
+      my_data.left = readDistance(PD6, PD7);
+
+      #if DEBUG
+        debug_print();
+      #endif
+
+      delay(100);
+      break;
+    }
+    case 'P': {
+      my_data.right = readDistance(PD2, PD3);
+      my_data.left = readDistance(PD6, PD7);
+      #if DEBUG
+        debug_print();
+      #endif
+      delay(1000);
+    }
+
+    default:
+      // Unknown mode fallback
+      base_servo.write(CENTER_ANGLE);
+      delay(500);
+      break;
   }
-
-  base_servo.write(angle);
-
-  // Read sensors each sweep step
-  my_data.right = readDistance(TRIG_R, ECHO_R);
-  my_data.left = readDistance(TRIG_L, ECHO_L);
-
-  Serial.print("Radar angle: ");
-  Serial.print(angle);
-  Serial.print(" | R: ");
-  Serial.print(my_data.right);
-  Serial.print(" cm | L: ");
-  Serial.print(my_data.left);
-  Serial.println(" cm");
-
-  delay(100);  // sweep speed
 }
-
-#endif
