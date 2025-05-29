@@ -8,6 +8,16 @@
 #define BAUDRATE       9600
 #define DELAY_DEBOUNCE 75
 
+#define RADAR_STEP 2
+#define RADAR_DELAY 200
+
+#define RADAR_MIN_ANGLE 83
+#define RADAR_MAX_ANGLE 100
+
+#define SENTRY_LEFT_ANGLE 80
+#define SENTRY_RIGHT_ANGLE 100
+#define SENTRY_CENTER_ANGLE 90
+
 #define TRIG_R 2    // Right sensor trigger pin
 #define ECHO_R 3    // Right sensor echo pin
 
@@ -27,9 +37,6 @@
 Servo base_servo;               // Servo object
 const uint8_t SERVO_PIN = 9;   // Servo control pin (choose a PWM pin)
 
-const uint8_t CENTER_ANGLE = 90;
-const uint8_t LEFT_ANGLE = 60;
-const uint8_t RIGHT_ANGLE = 120;
 uint8_t modes_num[MODES_NUM];
 
 
@@ -175,24 +182,24 @@ bool check_in_sensor_sight(uint8_t distance) {
   return (distance >= 1 && distance < max_distance);
 }
 
-bool check_target_in_sight() {
+bool line_of_fire() {
   bool target_on_left = check_in_sensor_sight(my_data.left);
   bool target_on_right = check_in_sensor_sight(my_data.right);
 
   if (!target_on_left && !target_on_right) {
-    base_servo.write(CENTER_ANGLE);
+    base_servo.write(SENTRY_CENTER_ANGLE);
     return false;
   }
 
   if (target_on_left && target_on_right) {
-    base_servo.write(CENTER_ANGLE);
+    base_servo.write(SENTRY_CENTER_ANGLE);
     return true;
   }
 
   if (target_on_left) {
-    base_servo.write(RIGHT_ANGLE);
-  } else { // target_on_right
-    base_servo.write(LEFT_ANGLE);
+    base_servo.write(SENTRY_RIGHT_ANGLE);
+  } else {
+    base_servo.write(SENTRY_LEFT_ANGLE);
   }
 
 
@@ -346,13 +353,14 @@ void setup() {
   my_data.aggression = adc_read();
 
   base_servo.attach(SERVO_PIN);
-  base_servo.write(CENTER_ANGLE); // Start centered
+  base_servo.write(SENTRY_CENTER_ANGLE); // Start centered
   
   for (uint16_t i = 0; i < MODES_NUM; i++) {
     modes_num[i] = eeprom_read(i);
   }
-  
-  my_data.setting = modes_num[0];
+
+  my_data.setting_index = 0;
+  my_data.setting = modes_num[my_data.setting_index];
 
   PCICR |= (1 << PCIE0);     // Enable PCINT group 0 (PCINT0..7)
   PCMSK0 |= (1 << PCINT4);   // Enable PCINT4 (PB4 / D12)
@@ -375,7 +383,7 @@ void loop() {
           debug_print();
         #endif
 
-        bool target_in_sight = check_target_in_sight();
+        bool target_in_sight = line_of_fire();
 
         if (target_in_sight) {
           out_of_sight_time = 0;
@@ -388,27 +396,33 @@ void loop() {
       break;
     }
 
-    case 'R': {  // Mode R (Radar sweep mode)
+    case 'R': {
       static int8_t direction = 1;
-      static uint8_t angle = CENTER_ANGLE;
-
-      angle += 2 * direction;
-
-      if (angle >= 105 || angle <= 75) {
-        direction *= -1;
-        angle += 2 * direction; // prevent sticking at edge
-      }
-
+      static uint8_t angle = RADAR_MIN_ANGLE;
+    
       base_servo.write(angle);
-
+    
+      // Read sensors
       my_data.right = readDistance(PD2, PD3);
       my_data.left = readDistance(PD6, PD7);
-
+    
       #if DEBUG
         debug_print();
       #endif
-
-      delay(100);
+    
+      // Update angle
+      angle += RADAR_STEP * direction;
+    
+      // Reverse direction if limits reached
+      if (angle >= RADAR_MAX_ANGLE) {
+        angle = RADAR_MAX_ANGLE;
+        direction = -1;
+      } else if (angle <= RADAR_MIN_ANGLE) {
+        angle = RADAR_MIN_ANGLE;
+        direction = 1;
+      }
+    
+      delay(RADAR_DELAY);
       break;
     }
     case 'P': {
@@ -422,7 +436,7 @@ void loop() {
 
     default:
       // Unknown mode fallback
-      base_servo.write(CENTER_ANGLE);
+      base_servo.write(SENTRY_CENTER_ANGLE);
       delay(500);
       break;
   }
